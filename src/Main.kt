@@ -1,8 +1,9 @@
 import jdk.jfr.consumer.*
 import java.io.File
 import java.nio.file.Path
+import kotlin.math.roundToInt
 
-const val printEventStats = true
+const val printEventStats = false
 const val TOP_N = 10
 
 private const val INDENT = "  "
@@ -60,21 +61,44 @@ fun LocationSize.dump(totalSize: Long, indent: String = INDENT, hasNext: Boolean
 }
 
 class AllocationStats : Stats() {
+    class SizeCount {
+        var size = 0L
+        var count = 0L
+    }
+
     private var totalEvents = 0
-    private val cnameSize = HashMap<String, Long>()
+    private var threadAllocations = HashMap<Long, Long>()
+    private val sampledCnameSize = HashMap<String, Long>()
+    private val tracedCnameSizeCount = HashMap<String, SizeCount>()
     private val locationSize = LocationSize()
 
-    private val eventTypes = setOf(
+    private val sampleEventTypes = setOf(
         "jdk.ObjectAllocationInNewTLAB",
         "jdk.ObjectAllocationOutsideTLAB"
     )
 
     override fun add(event: RecordedEvent) {
-        if (event.eventType.name !in eventTypes) return
+        val eventName = event.eventType.name
+        if (eventName == "jdk.ThreadAllocationStatistics") {
+            val thread: RecordedThread = event.getThread("thread")
+            threadAllocations[thread.id] = event.getLong("allocated")
+            return
+        }
+        if (eventName == "jdk.ObjectCount") {
+            val cname: String = event.getValue<RecordedObject>("objectClass").getValue("name")
+            val size = event.getLong("totalSize")
+            val count = event.getLong("count")
+            tracedCnameSizeCount.getOrPut(cname) { SizeCount() }.let {
+                it.size += size
+                it.count += count
+            }
+            return
+        }
+        if (eventName !in sampleEventTypes) return
         totalEvents++
-        val size: Int = event.getValue("allocationSize")
+        val size = event.getLong("allocationSize")
         val cname: String = event.getValue<RecordedObject>("objectClass").getValue("name")
-        cnameSize[cname] = (cnameSize[cname] ?: 0L) + size
+        sampledCnameSize[cname] = (sampledCnameSize[cname] ?: 0L) + size
         val locations = event.stackTrace?.toLocations() ?: return
         var p = locationSize
         for (location in locations) {
@@ -86,15 +110,46 @@ class AllocationStats : Stats() {
 
     context(Log)
     override fun dump() {
-        val totalSize = cnameSize.values.sum()
+        val threadAllocatedSize = threadAllocations.values.sum()
+        val tracedAllocatedSize = tracedCnameSizeCount.values.sumOf { it.size }
+        val tracedAllocatedCount = tracedCnameSizeCount.values.sumOf { it.count }
+        val totalSampledSize = sampledCnameSize.values.sum()
         log("--- Allocation stats ---")
-        log("  Total allocations traced: ${fmtSize(totalSize)} bytes in $totalEvents events")
-        log("--- Top $TOP_N objects allocated ---")
-        for ((cname, size) in cnameSize.entries.sortedByDescending { it.value }.take(TOP_N)) {
-            log("  ${fmtCname(cname)} : ${fmtPercent(size, totalSize)} by size")
+        val threadAllocatedStr = fmtSize(threadAllocatedSize)
+        val tracedAllocatedStr = fmtSize(tracedAllocatedSize)
+        val totalSampledStr = fmtSize(totalSampledSize)
+        val totalLen = maxOf(threadAllocatedStr.length, tracedAllocatedStr.length, totalSampledStr.length)
+        val sampledFraction = totalSampledSize.toDouble() / threadAllocatedSize
+        log("  Total allocations by treads: ${threadAllocatedStr.padStart(totalLen)} bytes")
+        log("  Total allocations traced   : ${tracedAllocatedStr.padStart(totalLen)} bytes in $tracedAllocatedCount allocations")
+        log("  Total allocations sampled  : ${totalSampledStr.padStart(totalLen)} bytes (${(sampledFraction * 100_000).roundToInt() / 1000.0}% of all) in $totalEvents events")
+        // -------------------------------
+        val topTraced = tracedCnameSizeCount.entries.sortedByDescending { it.value.size }.take(TOP_N)
+        val topSampled = sampledCnameSize.entries.sortedByDescending { it.value }.take(TOP_N)
+        var nameLen = 0
+        var sizeLen = 0
+        for ((cname, sizeCount) in topTraced) {
+            val sizeStr = fmtSize(sizeCount.size)
+            nameLen = maxOf(nameLen, fmtCname(cname).length)
+            sizeLen = maxOf(sizeLen, sizeStr.length)
         }
-        log("--- Top $TOP_N allocation locations ---")
-        locationSize.dump(totalSize)
+        for ((cname, size) in topSampled) {
+            val sizeStr = fmtSize((size / sampledFraction).toLong())
+            nameLen = maxOf(nameLen, fmtCname(cname).length)
+            sizeLen = maxOf(sizeLen, sizeStr.length)
+        }
+        log("--- Top $TOP_N traced classes allocated ---")
+        for ((cname, sizeCount) in topTraced) {
+            val sizeStr = fmtSize(sizeCount.size)
+            log("  ${fmtCname(cname).padEnd(nameLen)} : ${sizeStr.padStart(sizeLen)} bytes, ${sizeCount.count} objects")
+        }
+        log("--- Top $TOP_N sampled classes allocated ---")
+        for ((cname, size) in topSampled) {
+            val sizeStr = fmtSize((size / sampledFraction).toLong())
+            log("  ${fmtCname(cname).padEnd(nameLen)} : ${sizeStr.padStart(sizeLen)} est bytes, ${fmtPercent(size, totalSampledSize).padStart(6)} by size")
+        }
+        log("--- Top $TOP_N sampled allocation locations ---")
+        locationSize.dump(totalSampledSize)
     }
 }
 
@@ -133,7 +188,8 @@ private fun analyze(file: String) {
             stats.forEach { it.add(event) }
         }
     } catch (e: Throwable) {
-        log("Stopped because of $e")
+        log("Stopped because of exception")
+        e.printStackTrace(System.out)
     } finally {
         log("Parsed fully")
         rf.close()
@@ -143,17 +199,20 @@ private fun analyze(file: String) {
 
 fun fmtSize(size: Long): String = buildString {
     val s = size.toString()
-    val sc = (s.length - 1) / 3
+    val sc = (s.length + 2) / 3
     for (k in sc - 1 downTo 0) {
-        val i = s.length - (k + 1) * 3
+        val i = (s.length - (k + 1) * 3).coerceAtLeast(0)
         val j = s.length - k * 3
         append(s.substring(i, j))
-        if (k != 0) append(' ')
+        if (k != 0) append('\'')
     }
 }
 
-fun fmtPercent(size: Long, totalSize: Long): String =
-    "${size * 10000 / totalSize / 100.0}%"
+fun fmtPercent(size: Long, totalSize: Long): String {
+    val s = (size * 10000 / totalSize).toString().padStart(3, '0')
+    val i = s.length - 2
+    return "${s.substring(0, i)}.${s.substring(i)}%"
+}
 
 fun fmtCname(cname: String): String {
     var s = cname
