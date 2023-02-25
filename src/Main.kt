@@ -80,8 +80,8 @@ class AllocationStats : Stats() {
     override fun add(event: RecordedEvent) {
         val eventName = event.eventType.name
         if (eventName == "jdk.ThreadAllocationStatistics") {
-            val thread: RecordedThread = event.getThread("thread")
-            threadAllocations[thread.id] = event.getLong("allocated")
+            val id = event.getThread("thread")?.id ?: -1
+            threadAllocations[id] = event.getLong("allocated")
             return
         }
         if (eventName == "jdk.ObjectCount") {
